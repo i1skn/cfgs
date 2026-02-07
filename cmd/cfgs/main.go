@@ -28,13 +28,15 @@ type app struct {
 }
 
 type cfgsConfig struct {
-	RepoPath string `json:"repo_path"`
+	RepoPath    string   `json:"repo_path"`
+	IgnoreGlobs []string `json:"ignore_globs,omitempty"`
 }
 
 type doctorReport struct {
-	didNotTouch          []string
-	replacedWithSymlink  []string
-	requireManualResolve []string
+	didNotTouch           []string
+	replacedWithSymlink   []string
+	unlinkedOrphanSymlink []string
+	requireManualResolve  []string
 }
 
 type operationReport struct {
@@ -42,6 +44,18 @@ type operationReport struct {
 	succeeded []string
 	skipped   []string
 	failed    []string
+}
+
+type globMatcher struct {
+	pattern string
+	regex   *regexp.Regexp
+}
+
+var defaultIgnoreGlobs = []string{
+	"node_modules",
+	"node_modules/**",
+	"**/node_modules",
+	"**/node_modules/**",
 }
 
 func main() {
@@ -151,7 +165,18 @@ func (a *app) cmdInit(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if err := saveCfgsConfigRepo(repoPath); err != nil {
+	cfg, ok, err := loadCfgsConfig()
+	if err != nil {
+		return err
+	}
+	ignoreGlobs := append([]string(nil), defaultIgnoreGlobs...)
+	if ok && len(cfg.IgnoreGlobs) > 0 {
+		ignoreGlobs = append([]string(nil), cfg.IgnoreGlobs...)
+	}
+	if err := saveCfgsConfig(cfgsConfig{
+		RepoPath:    repoPath,
+		IgnoreGlobs: ignoreGlobs,
+	}); err != nil {
 		return err
 	}
 
@@ -373,6 +398,7 @@ func (a *app) cmdDoctorWithRepo(ctx context.Context, repoPath string) error {
 	}
 
 	report := doctorReport{}
+	managedSet := sliceToSet(managed)
 
 	for _, rel := range managed {
 		repoFile := filepath.Join(repoPath, filepath.FromSlash(rel))
@@ -439,6 +465,17 @@ func (a *app) cmdDoctorWithRepo(ctx context.Context, repoPath string) error {
 		}
 		report.replacedWithSymlink = append(report.replacedWithSymlink, rel)
 	}
+
+	ignoreMatchers, err := configuredIgnoreMatchers()
+	if err != nil {
+		return err
+	}
+	orphanReport, err := reconcileOrphanRepoSymlinks(repoPath, xdg, managedSet, ignoreMatchers)
+	if err != nil {
+		return err
+	}
+	report.unlinkedOrphanSymlink = append(report.unlinkedOrphanSymlink, orphanReport.unlinkedOrphanSymlink...)
+	report.requireManualResolve = append(report.requireManualResolve, orphanReport.requireManualResolve...)
 
 	printDoctorReport(a.out, report)
 
@@ -822,6 +859,15 @@ func printDoctorReport(w io.Writer, report doctorReport) {
 		}
 	}
 
+	fmt.Fprintln(w, "unlinked orphan symlink:")
+	if len(report.unlinkedOrphanSymlink) == 0 {
+		fmt.Fprintln(w, "  (none)")
+	} else {
+		for _, item := range report.unlinkedOrphanSymlink {
+			fmt.Fprintf(w, "  - %s\n", item)
+		}
+	}
+
 	fmt.Fprintln(w, "require manual reconcile:")
 	if len(report.requireManualResolve) == 0 {
 		fmt.Fprintln(w, "  (none)")
@@ -830,6 +876,119 @@ func printDoctorReport(w io.Writer, report doctorReport) {
 			fmt.Fprintf(w, "  - %s\n", item)
 		}
 	}
+}
+
+func reconcileOrphanRepoSymlinks(repoPath string, xdg string, managed map[string]struct{}, ignoreMatchers []globMatcher) (doctorReport, error) {
+	report := doctorReport{}
+	repoPath = filepath.Clean(repoPath)
+
+	err := filepath.WalkDir(xdg, func(fullPath string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return nil
+		}
+
+		rel, err := filepath.Rel(xdg, fullPath)
+		if err != nil {
+			return nil
+		}
+		rel = filepath.ToSlash(rel)
+
+		if d.IsDir() {
+			if shouldIgnorePath(rel, true, ignoreMatchers) {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if shouldIgnorePath(rel, false, ignoreMatchers) {
+			return nil
+		}
+		if d.Type()&os.ModeSymlink == 0 {
+			return nil
+		}
+
+		rel, err = normalizeManagedPath(rel)
+		if err != nil {
+			return nil
+		}
+		if _, ok := managed[rel]; ok {
+			return nil
+		}
+
+		target, inRepo, err := symlinkRepoTarget(fullPath, repoPath)
+		if err != nil || !inRepo {
+			return nil
+		}
+
+		targetInfo, err := os.Stat(target)
+		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				// Repo file is gone; remove dangling link as unlink behavior.
+				if err := os.Remove(fullPath); err != nil {
+					report.requireManualResolve = append(report.requireManualResolve, rel)
+					return nil
+				}
+				report.unlinkedOrphanSymlink = append(report.unlinkedOrphanSymlink, rel+" (removed dangling symlink)")
+				return nil
+			}
+			report.requireManualResolve = append(report.requireManualResolve, rel)
+			return nil
+		}
+		if !targetInfo.Mode().IsRegular() {
+			report.requireManualResolve = append(report.requireManualResolve, rel)
+			return nil
+		}
+
+		if err := os.Remove(fullPath); err != nil {
+			report.requireManualResolve = append(report.requireManualResolve, rel)
+			return nil
+		}
+		if err := copyFile(target, fullPath); err != nil {
+			report.requireManualResolve = append(report.requireManualResolve, rel)
+			return nil
+		}
+		report.unlinkedOrphanSymlink = append(report.unlinkedOrphanSymlink, rel)
+		return nil
+	})
+	if err != nil {
+		return doctorReport{}, err
+	}
+
+	sort.Strings(report.unlinkedOrphanSymlink)
+	sort.Strings(report.requireManualResolve)
+	return report, nil
+}
+
+func symlinkRepoTarget(linkPath string, repoPath string) (string, bool, error) {
+	rawTarget, err := os.Readlink(linkPath)
+	if err != nil {
+		return "", false, err
+	}
+
+	targetPath := rawTarget
+	if !filepath.IsAbs(targetPath) {
+		targetPath = filepath.Join(filepath.Dir(linkPath), targetPath)
+	}
+	targetPath = filepath.Clean(targetPath)
+
+	withinRepo, err := pathWithin(repoPath, targetPath)
+	if err != nil || !withinRepo {
+		return "", false, err
+	}
+	return targetPath, true, nil
+}
+
+func pathWithin(base string, candidate string) (bool, error) {
+	rel, err := filepath.Rel(filepath.Clean(base), filepath.Clean(candidate))
+	if err != nil {
+		return false, err
+	}
+	if rel == "." {
+		return true, nil
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+		return false, nil
+	}
+	return true, nil
 }
 
 func requireCommands(commands ...string) error {
@@ -1071,16 +1230,30 @@ func scanXDGRegularFiles() ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
+	ignoreMatchers, err := configuredIgnoreMatchers()
+	if err != nil {
+		return nil, err
+	}
 
 	var files []string
 	err = filepath.WalkDir(xdg, func(fullPath string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return nil
 		}
+
+		rel, err := filepath.Rel(xdg, fullPath)
+		if err != nil {
+			return nil
+		}
+		rel = filepath.ToSlash(rel)
+
 		if d.IsDir() {
-			if d.Name() == "node_modules" {
+			if shouldIgnorePath(rel, true, ignoreMatchers) {
 				return filepath.SkipDir
 			}
+			return nil
+		}
+		if shouldIgnorePath(rel, false, ignoreMatchers) {
 			return nil
 		}
 
@@ -1092,10 +1265,6 @@ func scanXDGRegularFiles() ([]string, error) {
 			}
 		}
 
-		rel, err := filepath.Rel(xdg, fullPath)
-		if err != nil {
-			return nil
-		}
 		normalized, err := normalizeManagedPath(rel)
 		if err != nil {
 			return nil
@@ -1201,13 +1370,14 @@ func loadCfgsConfig() (cfgsConfig, bool, error) {
 		return cfgsConfig{}, false, err
 	}
 	cfg.RepoPath = strings.TrimSpace(cfg.RepoPath)
+	cfg.IgnoreGlobs = sanitizeIgnoreGlobs(cfg.IgnoreGlobs)
 	if cfg.RepoPath == "" {
 		return cfgsConfig{}, false, nil
 	}
 	return cfg, true, nil
 }
 
-func saveCfgsConfigRepo(repoPath string) error {
+func saveCfgsConfig(cfg cfgsConfig) error {
 	configPath, err := cfgsConfigPath()
 	if err != nil {
 		return err
@@ -1215,11 +1385,107 @@ func saveCfgsConfigRepo(repoPath string) error {
 	if err := os.MkdirAll(filepath.Dir(configPath), 0o755); err != nil {
 		return err
 	}
-	data, err := json.Marshal(cfgsConfig{RepoPath: repoPath})
+	cfg.RepoPath = strings.TrimSpace(cfg.RepoPath)
+	cfg.IgnoreGlobs = sanitizeIgnoreGlobs(cfg.IgnoreGlobs)
+	data, err := json.Marshal(cfg)
 	if err != nil {
 		return err
 	}
 	return os.WriteFile(configPath, append(data, '\n'), 0o644)
+}
+
+func configuredIgnoreMatchers() ([]globMatcher, error) {
+	cfg, ok, err := loadCfgsConfig()
+	if err != nil {
+		return nil, err
+	}
+	patterns := defaultIgnoreGlobs
+	if ok && len(cfg.IgnoreGlobs) > 0 {
+		patterns = cfg.IgnoreGlobs
+	}
+	return compileGlobMatchers(patterns)
+}
+
+func sanitizeIgnoreGlobs(patterns []string) []string {
+	var out []string
+	for _, pattern := range patterns {
+		p := strings.TrimSpace(pattern)
+		if p == "" {
+			continue
+		}
+		p = strings.ReplaceAll(p, "\\", "/")
+		p = strings.TrimPrefix(p, "./")
+		out = append(out, p)
+	}
+	sort.Strings(out)
+	return unique(out)
+}
+
+func compileGlobMatchers(patterns []string) ([]globMatcher, error) {
+	patterns = sanitizeIgnoreGlobs(patterns)
+	matchers := make([]globMatcher, 0, len(patterns))
+	for _, pattern := range patterns {
+		src, err := globToRegex(pattern)
+		if err != nil {
+			return nil, fmt.Errorf("invalid ignore glob %q: %w", pattern, err)
+		}
+		re, err := regexp.Compile(src)
+		if err != nil {
+			return nil, fmt.Errorf("invalid ignore glob %q: %w", pattern, err)
+		}
+		matchers = append(matchers, globMatcher{
+			pattern: pattern,
+			regex:   re,
+		})
+	}
+	return matchers, nil
+}
+
+func globToRegex(pattern string) (string, error) {
+	pattern = strings.TrimSpace(pattern)
+	if pattern == "" {
+		return "", fmt.Errorf("empty pattern")
+	}
+
+	var b strings.Builder
+	b.WriteString("^")
+	for i := 0; i < len(pattern); i++ {
+		ch := pattern[i]
+		switch ch {
+		case '*':
+			if i+1 < len(pattern) && pattern[i+1] == '*' {
+				b.WriteString(".*")
+				i++
+			} else {
+				b.WriteString("[^/]*")
+			}
+		case '?':
+			b.WriteString("[^/]")
+		default:
+			if strings.ContainsRune(`.+()|[]{}^$\\`, rune(ch)) {
+				b.WriteByte('\\')
+			}
+			b.WriteByte(ch)
+		}
+	}
+	b.WriteString("$")
+	return b.String(), nil
+}
+
+func shouldIgnorePath(rel string, isDir bool, matchers []globMatcher) bool {
+	rel = strings.TrimSpace(filepath.ToSlash(rel))
+	if rel == "" || rel == "." {
+		return false
+	}
+	for _, matcher := range matchers {
+		if matcher.regex.MatchString(rel) {
+			return true
+		}
+		if isDir && matcher.regex.MatchString(rel+"/") {
+			return true
+		}
+	}
+	return false
 }
 
 func loadManagedFiles(repoPath string) ([]string, error) {
